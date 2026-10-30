@@ -876,6 +876,42 @@ impl CortexM33 {
             self.exclusive_address = None;
             return 2;
         }
+        // Armv8-M load-acquire / store-release: LDA{B,H}, LDAEX{B,H}, STL{B,H},
+        // STLEX{B,H} (T1 encodings):
+        //   hw0 = 0xE8D0 | Rn (load) or 0xE8C0 | Rn (store)
+        //   hw1 = Rt:4 1111 op:4 Rd:4   (Rd = 1111 for loads and plain stores)
+        //   op = 1000 B / 1001 H / 1010 word; 1100 / 1101 / 1110 exclusive.
+        // Each core already performs its accesses in program order, so these
+        // behave as LDR/STR/LDREX/STREX of the given size.
+        // pico-sdk 2.x uses LDAEXB/STLEXB for its software spin locks on
+        // RP2350 (RP2350-E2 erratum workaround).
+        if (hw0 & 0xFFE0) == 0xE8C0 && (hw1 >> 8) & 0xF == 0xF {
+            let op = (hw1 >> 4) & 0xF;
+            if matches!(op, 0x8 | 0x9 | 0xA | 0xC | 0xD | 0xE) {
+                let load = hw0 & 0x10 != 0;
+                let rn = (hw0 & 0xF) as usize;
+                let rt = ((hw1 >> 12) & 0xF) as usize;
+                let addr = self.regs.r[rn];
+                let excl = op & 0x4 != 0;
+                if load {
+                    if hw1 & 0xF == 0xF {
+                        let v = match op & 3 { 0 => self.bus_read8(addr, bus) as u32, 1 => self.bus_read16(addr, bus) as u32, _ => self.bus_read32(addr, bus) };
+                        self.regs.r[rt] = v;
+                        if excl { self.exclusive_address = Some(addr & !3); }
+                        return 2;
+                    }
+                } else {
+                    let rd = (hw1 & 0xF) as usize;
+                    let do_store = !excl || self.exclusive_address == Some(addr & !3);
+                    if do_store {
+                        let v = self.regs.r[rt];
+                        match op & 3 { 0 => self.bus_write8(addr, v as u8, bus), 1 => self.bus_write16(addr, v as u16, bus), _ => self.bus_write32(addr, v, bus) }
+                    }
+                    if excl { self.regs.r[rd] = if do_store { 0 } else { 1 }; self.exclusive_address = None; }
+                    return 2;
+                }
+            }
+        }
         // (Falls through to LDRD/STRD for any other unrecognized pattern)
 
         // LDRD/STRD (immediate): default path

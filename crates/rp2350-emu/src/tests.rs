@@ -35426,3 +35426,194 @@ fn resets_narrow_writes_widen_to_32_bit() {
     bus.write16(0x4002_2002, 0xABCD, 0);
     assert_eq!(bus.read32(0x4002_0000, 0), 0xABCD_0000);
 }
+
+// ============================================================================
+// Armv8-M load-acquire / store-release (LDA*, LDAEX*, STL*, STLEX*)
+// Encodings checked against GNU as (`.cpu cortex-m33`).
+// ============================================================================
+
+#[test]
+fn ldaexb_stlexb_success() {
+    // ldaexb r3, [r2]      = e8d2 3fcf
+    // stlexb r0, r1, [r2]  = e8c2 1fc0
+    let (mut c, mut bus) = core_and_bus();
+    bus.write8(0x2000_0400, 0xAA, 0);
+    c.set_reg(2, 0x2000_0400);
+    c.set_reg(1, 0x5A);
+    c.execute_one_wide_with_bus(0xE8D2, 0x3FCF, &mut bus);
+    assert_eq!(c.reg(3), 0xAA, "LDAEXB zero-extends the byte");
+    assert_eq!(c.exclusive_address, Some(0x2000_0400));
+    assert!(c.pending_fault.is_none());
+    c.execute_one_wide_with_bus(0xE8C2, 0x1FC0, &mut bus);
+    assert_eq!(c.reg(0), 0, "STLEXB succeeds while the monitor is held");
+    assert_eq!(bus.read8(0x2000_0400, 0), 0x5A);
+    assert_eq!(c.exclusive_address, None);
+}
+
+#[test]
+fn ldaexb_clrex_stlexb_fail() {
+    let (mut c, mut bus) = core_and_bus();
+    bus.write8(0x2000_0404, 0xAA, 0);
+    c.set_reg(2, 0x2000_0404);
+    c.set_reg(1, 0x5A);
+    c.execute_one_wide_with_bus(0xE8D2, 0x3FCF, &mut bus); // LDAEXB
+    c.execute_one_wide_with_bus(0xF3BF, 0x8F2F, &mut bus); // CLREX
+    c.execute_one_wide_with_bus(0xE8C2, 0x1FC0, &mut bus); // STLEXB
+    assert_eq!(c.reg(0), 1, "STLEXB fails without the monitor");
+    assert_eq!(bus.read8(0x2000_0404, 0), 0xAA, "memory unchanged");
+}
+
+#[test]
+fn ldaexh_stlexh_and_ldaex_stlex_word() {
+    let (mut c, mut bus) = core_and_bus();
+    bus.write32(0x2000_0410, 0x1234_ABCD, 0);
+    c.set_reg(2, 0x2000_0410);
+    // ldaexh r3, [r2] = e8d2 3fdf ; stlexh r0, r1, [r2] = e8c2 1fd0
+    c.set_reg(1, 0xCAFE);
+    c.execute_one_wide_with_bus(0xE8D2, 0x3FDF, &mut bus);
+    assert_eq!(c.reg(3), 0xABCD);
+    c.execute_one_wide_with_bus(0xE8C2, 0x1FD0, &mut bus);
+    assert_eq!(c.reg(0), 0);
+    assert_eq!(bus.read32(0x2000_0410, 0), 0x1234_CAFE);
+    // ldaex r3, [r2] = e8d2 3fef ; stlex r0, r1, [r2] = e8c2 1fe0
+    c.set_reg(1, 0xDEAD_BEEF);
+    c.execute_one_wide_with_bus(0xE8D2, 0x3FEF, &mut bus);
+    assert_eq!(c.reg(3), 0x1234_CAFE);
+    c.execute_one_wide_with_bus(0xE8C2, 0x1FE0, &mut bus);
+    assert_eq!(c.reg(0), 0);
+    assert_eq!(bus.read32(0x2000_0410, 0), 0xDEAD_BEEF);
+}
+
+#[test]
+fn lda_stl_plain_forms() {
+    let (mut c, mut bus) = core_and_bus();
+    bus.write32(0x2000_0420, 0x8899_AABB, 0);
+    c.set_reg(2, 0x2000_0420);
+    c.execute_one_wide_with_bus(0xE8D2, 0x3FAF, &mut bus); // lda  r3, [r2]
+    assert_eq!(c.reg(3), 0x8899_AABB);
+    c.execute_one_wide_with_bus(0xE8D2, 0x3F8F, &mut bus); // ldab r3, [r2]
+    assert_eq!(c.reg(3), 0xBB);
+    c.execute_one_wide_with_bus(0xE8D2, 0x3F9F, &mut bus); // ldah r3, [r2]
+    assert_eq!(c.reg(3), 0xAABB);
+    assert_eq!(c.exclusive_address, None, "plain LDA* do not arm the monitor");
+    c.set_reg(1, 0x1122_3344);
+    c.execute_one_wide_with_bus(0xE8C2, 0x1FAF, &mut bus); // stl  r1, [r2]
+    assert_eq!(bus.read32(0x2000_0420, 0), 0x1122_3344);
+    c.set_reg(1, 0x55);
+    c.execute_one_wide_with_bus(0xE8C2, 0x1F8F, &mut bus); // stlb r1, [r2]
+    assert_eq!(bus.read32(0x2000_0420, 0), 0x1122_3355);
+    c.set_reg(1, 0x6677);
+    c.execute_one_wide_with_bus(0xE8C2, 0x1F9F, &mut bus); // stlh r1, [r2]
+    assert_eq!(bus.read32(0x2000_0420, 0), 0x1122_6677);
+    assert!(c.pending_fault.is_none());
+}
+
+// ============================================================================
+// FPv5-SP 64-bit transfers on coprocessor 11 (D registers alias S pairs)
+// Encodings checked against GNU as (`.fpu fpv5-sp-d16`).
+// ============================================================================
+
+const CPACR_CP10_ONLY: u32 = 0b11 << 20; // what pico-sdk's runtime init sets
+
+#[test]
+fn vpush_vpop_d_registers_with_cp10_only() {
+    let (mut c, mut bus) = core_and_bus();
+    c.ppb.cpacr = CPACR_CP10_ONLY;
+    c.regs.set_sp(0x2000_1000);
+    for i in 16..20 { c.regs.s[i] = i as f32; }
+    // vpush {d8-d9} = ed2d 8b04
+    c.execute_one_wide_with_bus(0xED2D, 0x8B04, &mut bus);
+    assert!(c.pending_fault.is_none(), "CP11 encodings follow the CP10 enable");
+    assert_eq!(c.regs.sp(), 0x2000_0FF0);
+    for k in 0..4u32 { assert_eq!(bus.read32(0x2000_0FF0 + 4 * k, 0), (16.0f32 + k as f32).to_bits()); }
+    for i in 16..20 { c.regs.s[i] = 0.0; }
+    // vpop {d8-d9} = ecbd 8b04
+    c.execute_one_wide_with_bus(0xECBD, 0x8B04, &mut bus);
+    assert!(c.pending_fault.is_none());
+    assert_eq!(c.regs.sp(), 0x2000_1000);
+    for i in 16..20 { assert_eq!(c.regs.s[i], i as f32); }
+}
+
+#[test]
+fn cp11_faults_when_cp10_disabled() {
+    let (mut c, mut bus) = core_and_bus();
+    c.ppb.cpacr = 0;
+    c.regs.set_sp(0x2000_1000);
+    c.execute_one_wide_with_bus(0xED2D, 0x8B04, &mut bus); // vpush {d8-d9}
+    assert!(c.pending_fault.is_some(), "NOCP when the FPU is disabled");
+}
+
+#[test]
+fn vldr_vstr_d_register() {
+    let (mut c, mut bus) = core_and_bus();
+    c.ppb.cpacr = CPACR_CP10_ONLY;
+    c.set_reg(1, 0x2000_0500);
+    bus.write32(0x2000_0508, 1.5f32.to_bits(), 0);
+    bus.write32(0x2000_050C, (-2.25f32).to_bits(), 0);
+    // vldr d0, [r1, #8] = ed91 0b02
+    c.execute_one_wide_with_bus(0xED91, 0x0B02, &mut bus);
+    assert_eq!((c.regs.s[0], c.regs.s[1]), (1.5, -2.25));
+    // vstr d1, [r1, #-8] = ed01 1b02
+    c.regs.s[2] = 3.0;
+    c.regs.s[3] = 4.0;
+    c.execute_one_wide_with_bus(0xED01, 0x1B02, &mut bus);
+    assert_eq!(bus.read32(0x2000_04F8, 0), 3.0f32.to_bits());
+    assert_eq!(bus.read32(0x2000_04FC, 0), 4.0f32.to_bits());
+    assert!(c.pending_fault.is_none());
+}
+
+#[test]
+fn vmov_d_register_core_pair() {
+    let (mut c, mut bus) = core_and_bus();
+    c.ppb.cpacr = CPACR_CP10_ONLY;
+    c.set_reg(0, 0x3F80_0000);
+    c.set_reg(1, 0x4000_0000);
+    // vmov d2, r0, r1 = ec41 0b12
+    c.execute_one_wide_with_bus(0xEC41, 0x0B12, &mut bus);
+    assert_eq!((c.regs.s[4], c.regs.s[5]), (1.0, 2.0));
+    c.set_reg(0, 0);
+    c.set_reg(1, 0);
+    // vmov r0, r1, d2 = ec51 0b12
+    c.execute_one_wide_with_bus(0xEC51, 0x0B12, &mut bus);
+    assert_eq!((c.reg(0), c.reg(1)), (0x3F80_0000, 0x4000_0000));
+    assert!(c.pending_fault.is_none());
+}
+
+#[test]
+fn vldmia_vstmia_d_registers() {
+    let (mut c, mut bus) = core_and_bus();
+    c.ppb.cpacr = CPACR_CP10_ONLY;
+    c.set_reg(0, 0x2000_0600);
+    for k in 0..4u32 { bus.write32(0x2000_0600 + 4 * k, (10.0f32 + k as f32).to_bits(), 0); }
+    // vldmia r0!, {d0-d1} = ecb0 0b04
+    c.execute_one_wide_with_bus(0xECB0, 0x0B04, &mut bus);
+    assert_eq!(c.reg(0), 0x2000_0610);
+    for i in 0..4 { assert_eq!(c.regs.s[i], 10.0 + i as f32); }
+    // vstmia r0, {d3} = ec80 3b02
+    c.regs.s[6] = 7.0;
+    c.regs.s[7] = 8.0;
+    c.execute_one_wide_with_bus(0xEC80, 0x3B02, &mut bus);
+    assert_eq!(c.reg(0), 0x2000_0610, "no writeback");
+    assert_eq!(bus.read32(0x2000_0610, 0), 7.0f32.to_bits());
+    assert_eq!(bus.read32(0x2000_0614, 0), 8.0f32.to_bits());
+}
+
+// ============================================================================
+// BOOTRAM boot locks
+// ============================================================================
+
+#[test]
+fn bootlock_claim_release_and_stat() {
+    let (_c, mut bus) = core_and_bus();
+    const STAT: u32 = 0x400E_0808;
+    const LOCK7: u32 = 0x400E_0828;
+    const LOCK0: u32 = 0x400E_080C;
+    assert_eq!(bus.read32(STAT, 0), 0);
+    assert_ne!(bus.read32(LOCK7, 0), 0, "first read claims a free lock");
+    assert_eq!(bus.read32(LOCK7, 0), 0, "second read fails while held");
+    assert_ne!(bus.read32(LOCK0, 0), 0);
+    assert_eq!(bus.read32(STAT, 0), 0x81);
+    bus.write32(LOCK7, 0, 0);
+    assert_eq!(bus.read32(STAT, 0), 0x01, "any write releases");
+    assert_ne!(bus.read32(LOCK7, 0), 0, "claimable again after release");
+}

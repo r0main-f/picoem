@@ -564,8 +564,13 @@ impl CortexM33 {
     /// coproc is 10 or 11.
     pub(crate) fn fpu_execute<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let coproc = ((hw1 >> 8) & 0xF) as u8;
-        if coproc == 11 {
-            // Double-precision not present on RP2350
+        // Double-precision *arithmetic* is absent on RP2350 (FPv5-SP), but the
+        // 64-bit transfer forms that name D registers are part of FPv5-SP and
+        // compilers emit them (e.g. `vpush {d8-d9}` in function prologues):
+        // VLDR/VSTR/VLDM/VSTM/VPUSH/VPOP on Dn, and VMOV Dm <-> Rt, Rt2.
+        // These live in the LDC/STC/MCRR/MRRC space (hw0 = 0b1110_110x_xxxx_xxxx).
+        let cp11_transfer = coproc == 11 && (hw0 & 0xFE00) == 0xEC00;
+        if coproc == 11 && !cp11_transfer {
             return self.thumb32_undefined(hw0, hw1, bus);
         }
 
@@ -591,6 +596,9 @@ impl CortexM33 {
             }
         }
         self.regs.control |= crate::core::exceptions::CONTROL_FPCA;
+        if coproc == 11 {
+            return self.fpu_cp11_transfer(hw0, hw1, bus);
+        }
 
         // Armv8-M FP extensions (VSEL, VMAXNM, VMINNM) are encoded with the
         // 0xFE prefix; the existing VFPv4 ops live under 0xEE.
@@ -1125,6 +1133,78 @@ impl CortexM33 {
     // For multiple (VLDM/VSTM): P and U determine direction
     //   Sd = (Vd << 1) | D  (first register)
     //   Count = imm8 (number of single registers)
+
+    /// 64-bit transfers on an FPv5-SP core, where Dn aliases S[2n], S[2n+1]
+    /// (Armv8-M ARM, "Floating-point register transfer" / "Extension
+    /// register load/store"). Only D0-D15 exist.
+    fn fpu_cp11_transfer<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
+        if (hw0 & 0xFFE0) == 0xEC40 {
+            // VMOV Dm <-> Rt, Rt2: hw0 = 1110 1100 010 op Rt2, hw1 = Rt 1011 00 M 1 Vm
+            let to_core = hw0 & 0x10 != 0;
+            let rt2 = (hw0 & 0xF) as usize;
+            let rt = ((hw1 >> 12) & 0xF) as usize;
+            let dm = ((((hw1 >> 5) & 1) << 4) | (hw1 & 0xF)) as usize;
+            if dm >= 16 { return self.thumb32_undefined(hw0, hw1, bus); }
+            if to_core {
+                self.regs.r[rt] = self.regs.s[2 * dm].to_bits();
+                self.regs.r[rt2] = self.regs.s[2 * dm + 1].to_bits();
+            } else {
+                self.regs.s[2 * dm] = f32::from_bits(self.regs.r[rt]);
+                self.regs.s[2 * dm + 1] = f32::from_bits(self.regs.r[rt2]);
+            }
+            return 1;
+        }
+        let p = (hw0 >> 8) & 1;
+        let u = (hw0 >> 7) & 1;
+        let w = (hw0 >> 5) & 1;
+        let l = (hw0 >> 4) & 1;
+        let rn = (hw0 & 0xF) as usize;
+        let dd = ((((hw0 >> 6) & 1) << 4) | ((hw1 >> 12) & 0xF)) as usize;
+        let imm8 = (hw1 & 0xFF) as u32;
+        let base_s = 2 * dd;
+        // P=0,U=0 is the 64-bit move space (only the VMOV form above is valid);
+        // P=1,U=1,W=1 is unallocated.
+        if (p == 0 && u == 0) || (p == 1 && u == 1 && w == 1) {
+            return self.thumb32_undefined(hw0, hw1, bus);
+        }
+        if p == 1 && w == 0 {
+            // VLDR.64 / VSTR.64
+            let base = if rn == 15 { self.read_pc() & !0x3 } else { self.regs.r[rn] };
+            let addr = if u != 0 { base.wrapping_add(imm8 << 2) } else { base.wrapping_sub(imm8 << 2) };
+            if base_s + 1 >= 32 { return self.thumb32_undefined(hw0, hw1, bus); }
+            if l != 0 {
+                self.regs.s[base_s] = f32::from_bits(self.bus_read32(addr, bus));
+                self.regs.s[base_s + 1] = f32::from_bits(self.bus_read32(addr.wrapping_add(4), bus));
+                3
+            } else {
+                self.bus_write32(addr, self.regs.s[base_s].to_bits(), bus);
+                self.bus_write32(addr.wrapping_add(4), self.regs.s[base_s + 1].to_bits(), bus);
+                2
+            }
+        } else {
+            // VLDM / VSTM / VPUSH / VPOP on D registers: imm8 = 2 x number of
+            // D registers (an odd imm8 is the legacy FLDMX/FSTMX form; the
+            // extra word only moves the base). More than 16 D registers, or
+            // running past D15, is UNPREDICTABLE: treat as UNDEFINED.
+            let words = (imm8 & !1) as usize;
+            if words == 0 || words > 32 || base_s + words > 32 {
+                return self.thumb32_undefined(hw0, hw1, bus);
+            }
+            let base = self.regs.r[rn];
+            let mut addr = if u != 0 { base } else { base.wrapping_sub(imm8 << 2) };
+            for i in 0..words {
+                let reg = base_s + i;
+                if reg >= 32 { break; }
+                if l != 0 { self.regs.s[reg] = f32::from_bits(self.bus_read32(addr, bus)); }
+                else { self.bus_write32(addr, self.regs.s[reg].to_bits(), bus); }
+                addr = addr.wrapping_add(4);
+            }
+            if w != 0 {
+                self.regs.r[rn] = if u != 0 { base.wrapping_add(imm8 << 2) } else { base.wrapping_sub(imm8 << 2) };
+            }
+            if l != 0 { 1 + words as u32 } else { words as u32 }
+        }
+    }
 
     fn fpu_load_store<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let p = (hw0 >> 8) & 1;

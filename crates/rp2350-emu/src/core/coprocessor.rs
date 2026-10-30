@@ -14,7 +14,13 @@ impl CortexM33 {
         // Check CPACR (2 bits per coprocessor). Phase 0b.1 Commit B:
         // per-core PPB (including CPACR) now lives on `self.ppb`.
         let cpacr = self.ppb.cpacr;
-        let access = (cpacr >> (coproc as u32 * 2)) & 0x3;
+        // M-profile: coprocessor 11 (the D-register / 64-bit FP transfer
+        // encodings) is governed by the CP10 enable, as QEMU's M-profile model
+        // also does. The pico-sdk's runtime_init_per_core_enable_coprocessors
+        // sets CPACR.CP10 only, and real RP2350 silicon then executes
+        // `vpush {d8-d9}` (coproc 11) without a NOCP fault.
+        let gate = if coproc == 11 { 10 } else { coproc };
+        let access = (cpacr >> (gate as u32 * 2)) & 0x3;
         if access == 0 {
             self.pending_fault = Some(Fault::UsageFault);
             return 0;

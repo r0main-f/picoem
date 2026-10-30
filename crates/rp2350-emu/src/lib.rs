@@ -533,6 +533,7 @@ impl Emulator {
         for pio in &mut self.bus.pio {
             pio.reset();
         }
+        self.bus.bootlocks = 0;
         self.bus.gpio_in.store(0, Ordering::Relaxed);
         self.bus.gpio_in_hi.store(0, Ordering::Relaxed);
         // External-input stimulus (harness-owned pin forcing) survives

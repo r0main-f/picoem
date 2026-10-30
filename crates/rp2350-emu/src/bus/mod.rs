@@ -50,6 +50,10 @@ use crate::threaded::CoreAtomics;
 /// See HLD `2026.04.14 - HLD - Decoded-Op Cache.md` §3.
 pub(crate) const DECODE_CACHE_SIZE: usize = 16384;
 
+/// BOOTRAM boot-lock registers (RP2350 datasheet, BOOTRAM register list).
+pub(crate) const BOOTLOCK_STAT: u32 = 0x400E_0808;
+pub(crate) const BOOTLOCK0: u32 = 0x400E_080C;
+
 /// One decoded instruction. 12 bytes. `Copy`.
 ///
 /// Populated lazily on a cache miss by `CortexM33::populate_decode_cache`.
@@ -301,6 +305,8 @@ pub struct Bus {
     /// `Bus` per HLD `2026.04.15 - HLD - RP2040 Peripheral Coverage V7.md`
     /// §5.1; this map is the catch-all for the rest.
     pub(crate) peripheral_regs: HashMap<u32, u32>,
+    /// BOOTRAM boot locks 0..7 (RP2350 datasheet, BOOTRAM registers): bit n set = lock n claimed.
+    pub(crate) bootlocks: u8,
     /// Cross-core atomics (halted/WFE/event_flag/irq_pending/RCP/bus_fault).
     /// Shared via `Arc` with the two `CortexM33` cores — Phase 3 Stage 1
     /// (LLD V7 §2). In the single-threaded path, Bus is the sole owner
@@ -597,6 +603,7 @@ impl Bus {
             last_access_cycles: 0,
             extra_wait_states: 0,
             peripheral_regs: HashMap::new(),
+            bootlocks: 0,
             resets_state: RESETS_POST_BOOTROM,
             ticks: TicksRegs::post_bootrom(),
             timer0: TimerRegs::new(IRQ_TIMER0_IRQ_0),
@@ -1337,6 +1344,35 @@ impl Bus {
         }
     }
 
+    /// BOOTRAM boot locks (0x400E_0808 BOOTLOCK_STAT, 0x400E_080C..0x400E_0828 BOOTLOCK0..7).
+    /// Like the SIO spinlocks: reading BOOTLOCKn claims the lock and returns non-zero if it was free,
+    /// 0 if already held; writing any value releases it. The pico-sdk claims one in
+    /// `runtime_init_bootrom_locking_enable` and spins until the read succeeds.
+    #[inline]
+    fn bootlock_read(&mut self, word_addr: u32) -> Option<u32> {
+        if word_addr == BOOTLOCK_STAT {
+            return Some(self.bootlocks as u32);
+        }
+        if (BOOTLOCK0..=BOOTLOCK0 + 7 * 4).contains(&word_addr) {
+            let bit = 1u8 << ((word_addr - BOOTLOCK0) / 4);
+            return Some(if self.bootlocks & bit == 0 {
+                self.bootlocks |= bit;
+                bit as u32
+            } else {
+                0
+            });
+        }
+        None
+    }
+
+    /// Release a boot lock on any write to BOOTLOCKn (no-op for other addresses).
+    #[inline]
+    fn bootlock_release(&mut self, word_addr: u32) {
+        if (BOOTLOCK0..=BOOTLOCK0 + 7 * 4).contains(&word_addr) {
+            self.bootlocks &= !(1u8 << ((word_addr - BOOTLOCK0) / 4));
+        }
+    }
+
     /// Set whether flash (XIP) content has been loaded.
     pub fn set_flash_loaded(&mut self, loaded: bool) {
         self.flash_loaded = loaded;
@@ -1689,7 +1725,10 @@ impl Bus {
                         }
                         _ => {
                             self.warn_unmodelled_mmio(word_addr);
-                            *self.peripheral_regs.get(&word_addr).unwrap_or(&0)
+                            match self.bootlock_read(word_addr) {
+                                Some(v) => v,
+                                None => *self.peripheral_regs.get(&word_addr).unwrap_or(&0),
+                            }
                         }
                     }
                 };
@@ -2188,6 +2227,7 @@ impl Bus {
                             let word_addr = canonical & !3;
                             let byte_idx = (canonical & 3) as usize;
                             self.warn_unmodelled_mmio(word_addr);
+                            self.bootlock_release(word_addr);
                             let old_word = *self.peripheral_regs.get(&word_addr).unwrap_or(&0);
                             let mut bytes = old_word.to_le_bytes();
                             let old_byte = bytes[byte_idx];
@@ -2452,7 +2492,10 @@ impl Bus {
                         }
                         _ => {
                             self.warn_unmodelled_mmio(word_addr);
-                            *self.peripheral_regs.get(&word_addr).unwrap_or(&0)
+                            match self.bootlock_read(word_addr) {
+                                Some(v) => v,
+                                None => *self.peripheral_regs.get(&word_addr).unwrap_or(&0),
+                            }
                         }
                     }
                 };
@@ -2920,6 +2963,7 @@ impl Bus {
                             let word_addr = canonical & !3;
                             let half_idx = ((canonical >> 1) & 1) as usize;
                             self.warn_unmodelled_mmio(word_addr);
+                            self.bootlock_release(word_addr);
                             let old_word = *self.peripheral_regs.get(&word_addr).unwrap_or(&0);
                             let mut halves: [u16; 2] = [old_word as u16, (old_word >> 16) as u16];
                             let old_half = halves[half_idx];
@@ -3085,7 +3129,10 @@ impl Bus {
                         }
                         _ => {
                             self.warn_unmodelled_mmio(canonical);
-                            *self.peripheral_regs.get(&canonical).unwrap_or(&0)
+                            match self.bootlock_read(canonical) {
+                                Some(v) => v,
+                                None => *self.peripheral_regs.get(&canonical).unwrap_or(&0),
+                            }
                         }
                     }
                 }
@@ -3282,6 +3329,7 @@ impl Bus {
                         _ => {
                             // Existing HashMap path with alias logic
                             self.warn_unmodelled_mmio(canonical);
+                            self.bootlock_release(canonical);
                             let old = *self.peripheral_regs.get(&canonical).unwrap_or(&0);
                             let new_val = match alias {
                                 0 => val,
